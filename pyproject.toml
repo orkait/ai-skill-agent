@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skills-registry-cli"
+version = "0.1.0"
+description = "Local registry CLI for AI agent skills"
+requires-python = ">=3.10"
+
+[project.scripts]
+skills = "cli:main"
+skills-cli = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli"]
