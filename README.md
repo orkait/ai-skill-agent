@@ -1,4 +1,4 @@
-﻿# AI Skill Agent (Local Skills Registry)
+# AI Skill Agent (Local Skills Registry)
 
 Minimal local registry for AI agent skills with a Typer-based CLI.
 
@@ -110,9 +110,9 @@ PS C:\skills> skills install
 [install] lenis-react -> kiro (C:\skills\.kiro\skills\lenis-react)
 [install] lenis-react -> gemini (C:\skills\.gemini\skills\lenis-react)
 [install] reactflow-v12 -> codex (C:\Users\Admin\.codex\skills\reactflow-v12)
-[install] reactflow-v12 -> claude (C:\skills\.claude\skills\reactflow-v12)
-[install] reactflow-v12 -> kiro (C:\skills\.kiro\skills\reactflow-v12)
-[install] reactflow-v12 -> gemini (C:\skills\.gemini\skills\reactflow-v12)
+[install] reactflow-v12 -> claude (C:\skills\.claude\skills\lenis-react)
+[install] reactflow-v12 -> kiro (C:\skills\.kiro\skills\lenis-react)
+[install] reactflow-v12 -> gemini (C:\skills\.gemini\skills\lenis-react)
 ```
 
 Use `--project` to target a specific repo:
