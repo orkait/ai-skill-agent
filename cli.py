@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
 from typing import Annotated, Optional
+
+from verification import verify_skill_directory
 
 
 def _load_typer():
@@ -30,6 +33,7 @@ HOME = Path.home()
 REGISTRY_ROOT = HOME / "skills"
 REGISTRY_SKILLS_DIR = REGISTRY_ROOT / "skills"
 BUILDER_PROMPT_PATH = REGISTRY_ROOT / "skill.build"
+IMPROVE_PROMPT_PATH = REGISTRY_ROOT / "skill.improve"
 AGENTS = ("codex", "claude", "kiro", "gemini")
 
 
@@ -43,11 +47,32 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def normalize_skill_name(name: str) -> str:
+    normalized = "-".join(name.strip().lower().replace("_", "-").split())
+    while "--" in normalized:
+        normalized = normalized.replace("--", "-")
+    return normalized.strip("-")
+
+
 def validate_skill_dir(skill_dir: Path) -> None:
     if not skill_dir.exists() or not skill_dir.is_dir():
         raise typer.BadParameter(f"Skill source is not a directory: {skill_dir}")
     if not (skill_dir / "SKILL.md").exists():
         raise typer.BadParameter(f"Missing SKILL.md in: {skill_dir}")
+
+
+def resolve_skill_source(source: str) -> Path:
+    """Accept either a filesystem path or a registered skill name."""
+    expanded = expand_home(source)
+    if expanded is not None and expanded.exists():
+        return expanded
+
+    ensure_dir(REGISTRY_SKILLS_DIR)
+    registry_candidate = (REGISTRY_SKILLS_DIR / source).resolve()
+    if registry_candidate.exists():
+        return registry_candidate
+
+    return (expanded if expanded is not None else registry_candidate)
 
 
 def list_registered_skill_names() -> list[str]:
@@ -105,6 +130,40 @@ def default_builder_prompt() -> str:
     )
 
 
+def default_improve_prompt() -> str:
+    return (
+        "ROLE\n"
+        "You are a Senior Agentic Skill Refiner. Improve an existing registered skill folder so it reaches STRICT quality while preserving correctness and usefulness.\n\n"
+        "ENTRY FORMAT (MANDATORY)\n"
+        "This prompt is invoked like: `~/skills/skill.improve <skill_name>`\n"
+        "Parse the invocation on the first line and extract `<skill_name>`.\n"
+        "If no skill name is provided, stop and ask for one.\n\n"
+        "DISCOVERY (MANDATORY)\n"
+        "1. Check whether `<skill_name>` exists in the local registry skill folder list.\n"
+        "2. If it does not exist, stop and ask the user to create/register the skill first.\n"
+        "3. Run: `skills verify <skill_name> --strict --verbose`\n"
+        "4. Use STRICT findings as the improvement checklist.\n\n"
+        "GOAL\n"
+        "Improve the entire registered skill folder (all relevant files, not just SKILL.md) so it passes STRICT mode.\n"
+        "Minor refinement additions are allowed if they improve clarity, consistency, and agentskills.io alignment.\n\n"
+        "COMMON FIXES FOR STRICT PASS\n"
+        "- Add/repair frontmatter fields used by strict quality checks (`triggers`, `references`, `activation`)\n"
+        "- Move examples/large code blocks out of `SKILL.md` into `references/`\n"
+        "- Reorganize references under taxonomy folders (`references/<category>/...`)\n"
+        "- Ensure `references` paths exist and are relative\n"
+        "- Add version governance / compatibility metadata\n"
+        "- Keep SKILL.md as 'brain only' (critical setup rules and invariants)\n\n"
+        "WORKFLOW\n"
+        "1. Verify in STRICT mode.\n"
+        "2. Load and edit files in the registered skill folder in-place.\n"
+        "3. Re-run STRICT verify.\n"
+        "4. Repeat until STRICT passes or clarification is needed.\n\n"
+        "CONSTRAINTS\n"
+        "- Do not copy to agent directories directly (`skills install` handles distribution).\n"
+        "- Preserve agentskills.io spec compliance while improving strict quality.\n"
+    )
+
+
 def project_root_from_option(project: str | None) -> Path:
     if project:
         return expand_home(project) or Path.cwd()
@@ -144,7 +203,28 @@ def copy_dir(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest)
 
 
-def install_skills(skill_names: list[str], agents: list[str], project_root: Path) -> None:
+def remove_dir_if_exists(target: Path) -> bool:
+    if not target.exists():
+        return False
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return True
+
+
+def require_force(force: bool, action: str) -> None:
+    if not force:
+        raise typer.BadParameter(f"{action} is destructive. Re-run with --force.")
+
+
+def install_skills(
+    skill_names: list[str],
+    agents: list[str],
+    project_root: Path,
+    *,
+    mode: str = "install",
+) -> None:
     if not skill_names:
         raise typer.BadParameter("No skills specified for install")
     targets = agent_targets(project_root)
@@ -158,17 +238,173 @@ def install_skills(skill_names: list[str], agents: list[str], project_root: Path
             ensure_dir(dest_root)
             dest = dest_root / skill_name
             copy_dir(src, dest)
-            typer.echo(f"[install] {skill_name} -> {agent} ({dest})")
+            if mode == "sync":
+                typer.echo(f"[sync] updated {skill_name} -> {dest}")
+            else:
+                typer.echo(f"[install] {skill_name} -> {agent} ({dest})")
+
+
+def desync_skills(skill_names: list[str], agents: list[str], project_root: Path) -> None:
+    if not skill_names:
+        raise typer.BadParameter("No skills specified for desync")
+    targets = agent_targets(project_root)
+    for skill_name in skill_names:
+        for agent in agents:
+            dest = targets[agent] / skill_name
+            if remove_dir_if_exists(dest):
+                typer.echo(f"[desync] removed {skill_name} from {agent} ({dest})")
+            else:
+                typer.echo(f"[desync] missing {skill_name} in {agent} ({dest})")
 
 
 def main() -> None:
     app()
 
 
+def _enforce_gate(result, gate: str) -> None:
+    gate = gate.lower().strip()
+    if gate not in {"spec", "strict"}:
+        raise typer.BadParameter("`--gate` must be `spec` or `strict`.")
+    if gate == "spec" and not result.spec_passed:
+        raise typer.Exit(code=1)
+    if gate == "strict" and not result.strict_passed:
+        raise typer.Exit(code=1)
+
+
+def _status_text(passed: bool) -> str:
+    return "PASS" if passed else "FAIL"
+
+
+def _status_color(passed: bool) -> str:
+    return "green" if passed else "red"
+
+
+def _render_issue_group(title: str, errors, warnings) -> None:
+    if not errors and not warnings:
+        return
+    typer.secho(f"\n{title}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+    for issue in errors:
+        typer.secho(f"  [ERROR] {issue.message}", fg=typer.colors.RED)
+    for issue in warnings:
+        typer.secho(f"  [WARN]  {issue.message}", fg=typer.colors.YELLOW)
+
+
+def _verification_payload(result, verbose: bool = False) -> dict:
+    payload = {
+        "skill_dir": str(result.skill_dir),
+        "grades": {
+            "spec": {"score": result.spec_grade, "status": _status_text(result.spec_passed)},
+            "strict": {
+                "score": result.strict_grade,
+                "status": _status_text(result.strict_passed),
+                "threshold": result.strict_threshold,
+            },
+        },
+        "counts": {
+            "spec": {"errors": len(result.spec_errors), "warnings": len(result.spec_warnings)},
+            "strict": {"errors": len(result.errors), "warnings": len(result.warnings)},
+        },
+    }
+    if verbose:
+        payload["findings"] = {
+            "spec": {
+                "errors": [i.message for i in result.spec_errors],
+                "warnings": [i.message for i in result.spec_warnings],
+            },
+            "strict": {
+                "errors": [i.message for i in result.errors],
+                "warnings": [i.message for i in result.warnings],
+            },
+        }
+    return payload
+
+
+def _print_verification_report_text(result, verbose: bool = False) -> None:
+    p = _verification_payload(result, verbose=verbose)
+    typer.echo(f"[verify] {p['skill_dir']}")
+    typer.echo(
+        f"[verify] SPEC   grade={p['grades']['spec']['score']}/100 status={p['grades']['spec']['status']} "
+        f"errors={p['counts']['spec']['errors']} warnings={p['counts']['spec']['warnings']}"
+    )
+    typer.echo(
+        f"[verify] STRICT grade={p['grades']['strict']['score']}/100 status={p['grades']['strict']['status']} "
+        f"threshold={p['grades']['strict']['threshold']} "
+        f"errors={p['counts']['strict']['errors']} warnings={p['counts']['strict']['warnings']}"
+    )
+    if not verbose:
+        if any([p["counts"]["spec"]["errors"], p["counts"]["spec"]["warnings"], p["counts"]["strict"]["errors"], p["counts"]["strict"]["warnings"]]):
+            typer.echo("[verify] Use --verbose for full findings.")
+        return
+    findings = p.get("findings", {})
+    for scope in ("spec", "strict"):
+        f = findings.get(scope, {})
+        if not f.get("errors") and not f.get("warnings"):
+            continue
+        typer.echo(f"[verify] {scope.upper()} Findings")
+        for msg in f.get("errors", []):
+            typer.echo(f"  {scope.upper()} ERROR: {msg}")
+        for msg in f.get("warnings", []):
+            typer.echo(f"  {scope.upper()} WARN: {msg}")
+
+
+def _print_verification_report(result, verbose: bool = False, output: str = "pretty") -> None:
+    output = output.lower().strip()
+    if output not in {"pretty", "text", "json"}:
+        raise typer.BadParameter("`--output` must be `pretty`, `text`, or `json`.")
+    if output == "json":
+        typer.echo(json.dumps(_verification_payload(result, verbose=verbose), indent=2))
+        return
+    if output == "text":
+        _print_verification_report_text(result, verbose=verbose)
+        return
+
+    typer.secho(f"\nVerify: {result.skill_dir}", fg=typer.colors.CYAN, bold=True)
+    typer.echo("-" * 72)
+
+    typer.echo("Grades")
+    typer.secho(
+        f"  SPEC   : {_status_text(result.spec_passed)}  ({result.spec_grade}/100)",
+        fg=_status_color(result.spec_passed),
+        bold=result.spec_passed,
+    )
+    strict_text = (
+        f"  STRICT : {_status_text(result.strict_passed)}  "
+        f"({result.strict_grade}/100, threshold={result.strict_threshold})"
+    )
+    typer.secho(
+        strict_text,
+        fg=_status_color(result.strict_passed),
+        bold=result.strict_passed,
+    )
+    typer.echo(
+        f"Counts  SPEC(e={len(result.spec_errors)}, w={len(result.spec_warnings)})  "
+        f"STRICT(e={len(result.errors)}, w={len(result.warnings)})"
+    )
+
+    if not result.spec_issues and not result.issues:
+        typer.secho("\nNo findings.", fg=typer.colors.GREEN)
+        return
+
+    if not verbose:
+        if result.spec_errors or result.errors:
+            _render_issue_group("Errors", result.spec_errors + result.errors, [])
+        typer.secho(
+            "\nTip: Use --verbose for full spec/strict warnings and grouped findings.",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+        return
+
+    _render_issue_group("Spec Findings", result.spec_errors, result.spec_warnings)
+    _render_issue_group("Strict Findings", result.errors, result.warnings)
+
+
 @app.command()
 def init(
     force_prompt: Annotated[bool, typer.Option("--force-prompt", help="Rewrite ~/skills/skill.build")]
     = False,
+    force_improve_prompt: Annotated[
+        bool, typer.Option("--force-improve-prompt", help="Rewrite ~/skills/skill.improve")
+    ] = False,
 ) -> None:
     """Create ~/skills layout and seed skill.build."""
     ensure_dir(REGISTRY_ROOT)
@@ -179,6 +415,12 @@ def init(
         typer.echo(f"Wrote prompt: {BUILDER_PROMPT_PATH}")
     else:
         typer.echo(f"Prompt exists: {BUILDER_PROMPT_PATH}")
+
+    if force_improve_prompt or not IMPROVE_PROMPT_PATH.exists():
+        IMPROVE_PROMPT_PATH.write_text(default_improve_prompt(), encoding="utf-8")
+        typer.echo(f"Wrote improve prompt: {IMPROVE_PROMPT_PATH}")
+    else:
+        typer.echo(f"Improve prompt exists: {IMPROVE_PROMPT_PATH}")
 
     typer.echo(f"Registry skills dir: {REGISTRY_SKILLS_DIR}")
 
@@ -195,6 +437,71 @@ def list_cmd() -> None:
 
 
 @app.command()
+def create(
+    name: Annotated[str, typer.Argument(help="Skill name (used as folder name)")],
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing registry skill folder")] = False,
+) -> None:
+    """Create a minimal skill scaffold in ~/skills/skills/<name>."""
+    ensure_dir(REGISTRY_SKILLS_DIR)
+
+    skill_name = normalize_skill_name(name)
+    if not skill_name:
+        raise typer.BadParameter("Skill name is empty after normalization")
+
+    skill_dir = REGISTRY_SKILLS_DIR / skill_name
+    references_dir = skill_dir / "references"
+    misc_references_dir = references_dir / "misc"
+    skill_md = skill_dir / "SKILL.md"
+
+    if skill_dir.exists():
+        if not force:
+            raise typer.BadParameter(
+                f"Skill already exists: {skill_dir}. Use --force to overwrite."
+            )
+        shutil.rmtree(skill_dir)
+
+    ensure_dir(misc_references_dir)
+    skill_md.write_text(
+        (
+            "---\n"
+            f"name: {skill_name}\n"
+            "description: >-\n"
+            f"  Describe what the `{skill_name}` skill does and when to use it.\n"
+            "triggers:\n"
+            f"  - {skill_name}\n"
+            "references:\n"
+            "  - references/misc/overview.md\n"
+            "compatibility: \"Add supported versions/platforms here\"\n"
+            "metadata:\n"
+            "  skill_version: \"0.1.0\"\n"
+            "  owner: \"\"\n"
+            "activation:\n"
+            "  mode: fuzzy\n"
+            "  triggers:\n"
+            f"    - {skill_name}\n"
+            "  priority: normal\n"
+            "---\n\n"
+            "# Skill Instructions\n\n"
+            "Keep this file focused on critical setup rules and invariants only.\n\n"
+            "## Critical Rules\n\n"
+            "1. Replace this scaffold with the actual setup constraints.\n"
+            "2. Move detailed docs/examples into `references/` files.\n"
+        ),
+        encoding="utf-8",
+    )
+    (misc_references_dir / "overview.md").write_text(
+        (
+            f"# {skill_name} Reference\n\n"
+            "Add detailed documentation, examples, API notes, and patterns here.\n"
+        ),
+        encoding="utf-8",
+    )
+
+    typer.echo(f"[create] scaffolded {skill_dir}")
+    typer.echo(f"[create] edit {skill_md}")
+
+
+@app.command()
 def register(
     source: Annotated[Optional[str], typer.Argument(help="Path to generated skill folder")] = None,
     name: Annotated[Optional[str], typer.Option("--name", help="Override registry skill folder name")] = None,
@@ -203,6 +510,9 @@ def register(
     = [],
     project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")]
     = None,
+    gate: Annotated[str, typer.Option("--gate", help="Registration gate: spec or strict")] = "spec",
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show full verification findings")] = False,
+    output: Annotated[str, typer.Option("--output", help="Verification output format: pretty, text, json")] = "pretty",
 ) -> None:
     """Register a skill into ~/skills/skills."""
     if not source:
@@ -212,10 +522,18 @@ def register(
     if src_path is None:
         raise typer.BadParameter("Missing source path")
     validate_skill_dir(src_path)
+    verification = verify_skill_directory(src_path)
+    _print_verification_report(verification, verbose=verbose, output=output)
+    _enforce_gate(verification, gate)
 
     skill_name = (name or src_path.name).strip()
     if not skill_name:
         raise typer.BadParameter("Resolved skill name is empty")
+    frontmatter_name = verification.get_frontmatter_name()
+    if frontmatter_name and name and skill_name != frontmatter_name:
+        raise typer.BadParameter(
+            f"--name ({skill_name}) must match SKILL.md frontmatter name ({frontmatter_name}) to remain spec-compliant."
+        )
 
     ensure_dir(REGISTRY_SKILLS_DIR)
     dest = REGISTRY_SKILLS_DIR / skill_name
@@ -224,6 +542,53 @@ def register(
 
     if install:
         install_skills([skill_name], parse_agents(agent), project_root_from_option(project))
+
+
+@app.command()
+def verify(
+    source: Annotated[str, typer.Argument(help="Path to a skill folder OR registered skill name")],
+    gate: Annotated[str, typer.Option("--gate", help="Exit-code gate: spec or strict")] = "spec",
+    strict: Annotated[bool, typer.Option("--strict", help="Shortcut for --gate strict")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show full verification findings")] = False,
+    output: Annotated[str, typer.Option("--output", help="Output format: pretty, text, json")] = "pretty",
+) -> None:
+    """Validate a skill folder against the Agent Skills spec checks."""
+    src_path = resolve_skill_source(source)
+    if src_path is None:
+        raise typer.BadParameter("Missing source path")
+    if strict:
+        gate = "strict"
+    result = verify_skill_directory(src_path)
+    _print_verification_report(result, verbose=verbose, output=output)
+    _enforce_gate(result, gate)
+
+
+@app.command()
+def deregister(
+    skill_name: Annotated[Optional[str], typer.Argument(help="Registered skill name")] = None,
+    all: Annotated[bool, typer.Option("--all", help="Remove all registered skills from registry")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Confirm destructive removal")] = False,
+) -> None:
+    """Remove skill(s) from the global registry (~/skills/skills)."""
+    require_force(force, "deregister")
+    ensure_dir(REGISTRY_SKILLS_DIR)
+
+    if all:
+        names = list_registered_skill_names()
+        if not names:
+            typer.echo("No registered skills to deregister.")
+            raise typer.Exit(0)
+    elif skill_name:
+        names = [skill_name]
+    else:
+        raise typer.BadParameter("Provide <skill-name> or use --all.")
+
+    for name in names:
+        target = REGISTRY_SKILLS_DIR / name
+        if remove_dir_if_exists(target):
+            typer.echo(f"[deregister] removed {target}")
+        else:
+            typer.echo(f"[deregister] missing {target}")
 
 
 @app.command()
@@ -250,17 +615,46 @@ def install(
 
 @app.command()
 def sync(
+    skill_names: Annotated[
+        list[str],
+        typer.Argument(help="Optional registered skill names to sync (defaults to all if omitted)"),
+    ] = [],
     agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
     = [],
     project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")]
     = None,
 ) -> None:
-    """Install all registered skills to agent directories."""
-    skills = list_registered_skill_names()
+    """Sync registered skill(s) to agent directories (all if no skill names are provided)."""
+    skills = skill_names or list_registered_skill_names()
     if not skills:
         typer.echo("No registered skills to sync.")
         raise typer.Exit(0)
-    install_skills(skills, parse_agents(agent), project_root_from_option(project))
+    install_skills(skills, parse_agents(agent), project_root_from_option(project), mode="sync")
+
+
+@app.command()
+def desync(
+    skill_name: Annotated[Optional[str], typer.Argument(help="Installed/registered skill name")] = None,
+    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
+    = [],
+    project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")] = None,
+    all: Annotated[bool, typer.Option("--all", help="Remove all registered skills from agent directories")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Confirm destructive removal")] = False,
+) -> None:
+    """Remove installed skill copies from agent directories."""
+    require_force(force, "desync")
+
+    if all:
+        skills = list_registered_skill_names()
+        if not skills:
+            typer.echo("No registered skills to desync.")
+            raise typer.Exit(0)
+    elif skill_name:
+        skills = [skill_name]
+    else:
+        raise typer.BadParameter("Provide <skill-name> or use --all.")
+
+    desync_skills(skills, parse_agents(agent), project_root_from_option(project))
 
 
 @app.command()
@@ -274,6 +668,7 @@ def where(
     typer.echo(f"registryRoot: {REGISTRY_ROOT}")
     typer.echo(f"registrySkills: {REGISTRY_SKILLS_DIR}")
     typer.echo(f"builderPrompt: {BUILDER_PROMPT_PATH}")
+    typer.echo(f"improvePrompt: {IMPROVE_PROMPT_PATH}")
     typer.echo(f"projectRoot: {project_root}")
     for agent_name in AGENTS:
         typer.echo(f"{agent_name}: {targets[agent_name]}")
@@ -283,6 +678,57 @@ def where(
 def prompt() -> None:
     """Print the builder prompt path."""
     typer.echo(str(BUILDER_PROMPT_PATH))
+
+
+@app.command()
+def improve(
+    skill_name: Annotated[str, typer.Argument(help="Registered skill name to improve")],
+    verify_first: Annotated[
+        bool, typer.Option("--verify/--no-verify", help="Run STRICT verification before showing improve instructions")
+    ] = True,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show full STRICT findings when verifying")] = True,
+    output: Annotated[str, typer.Option("--output", help="Verify output format: pretty, text, json")] = "pretty",
+) -> None:
+    """Prepare improvement of a registered skill folder and show the LLM invocation."""
+    ensure_dir(REGISTRY_SKILLS_DIR)
+    skill_dir = (REGISTRY_SKILLS_DIR / skill_name).resolve()
+    if not skill_dir.exists() or not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
+        raise typer.BadParameter(
+            f"Registered skill not found: {skill_name}. Create/register it first in {REGISTRY_SKILLS_DIR}."
+        )
+
+    typer.secho(f"Improve Skill Folder: {skill_name}", fg=typer.colors.CYAN, bold=True)
+    typer.echo(f"Target folder: {skill_dir}")
+    typer.echo(f"LLM entrypoint: {IMPROVE_PROMPT_PATH} {skill_name}")
+
+    if verify_first:
+        typer.secho("\nPreflight STRICT verify", fg=typer.colors.BRIGHT_BLUE, bold=True)
+        result = verify_skill_directory(skill_dir)
+        _print_verification_report(result, verbose=verbose, output=output)
+        if result.strict_passed:
+            typer.secho(
+                "\nSTRICT already passes. You can still run the improve prompt for refinement if desired.",
+                fg=typer.colors.GREEN,
+            )
+        else:
+            typer.secho(
+                "\nNext step: run the LLM prompt and let it fix STRICT findings in-place.",
+                fg=typer.colors.YELLOW,
+            )
+
+    typer.echo(f"\nRun in Gemini/Claude CLI: {IMPROVE_PROMPT_PATH} {skill_name}")
+
+
+@app.command("improve-path")
+def improve_path() -> None:
+    """Print the improve prompt path (low-level helper)."""
+    typer.echo(str(IMPROVE_PROMPT_PATH))
+
+
+@app.command("improve-prompt")
+def improve_prompt_legacy() -> None:
+    """Deprecated alias for `improve-path` (kept for compatibility)."""
+    typer.echo(str(IMPROVE_PROMPT_PATH))
 
 
 if __name__ == "__main__":

@@ -13,4 +13,4 @@ skills = "cli:main"
 skills-cli = "cli:main"
 
 [tool.setuptools]
-py-modules = ["cli"]
+py-modules = ["cli", "verification"]
