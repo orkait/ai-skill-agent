@@ -135,17 +135,19 @@ def default_improve_prompt() -> str:
         "ROLE\n"
         "You are a Senior Agentic Skill Refiner. Improve an existing registered skill folder so it reaches STRICT quality while preserving correctness and usefulness.\n\n"
         "ENTRY FORMAT (MANDATORY)\n"
-        "This prompt is invoked like: `~/skills/skill.improve <skill_name>`\n"
-        "Parse the invocation on the first line and extract `<skill_name>`.\n"
-        "If no skill name is provided, stop and ask for one.\n\n"
+        "This prompt is invoked like: `~/skills/skill.improve <skill_name_or_path>`\n"
+        "Parse the invocation on the first line and extract `<skill_name_or_path>`.\n"
+        "If no target is provided, stop and ask for one.\n\n"
         "DISCOVERY (MANDATORY)\n"
-        "1. Check whether `<skill_name>` exists in the local registry skill folder list.\n"
-        "2. If it does not exist, stop and ask the user to create/register the skill first.\n"
-        "3. Run: `skills verify <skill_name> --strict --verbose`\n"
-        "4. Use STRICT findings as the improvement checklist.\n\n"
+        "1. If the argument looks like a path and exists, use that folder as the target skill folder.\n"
+        "2. Otherwise, treat it as a registered skill name and resolve the target folder from the local registry.\n"
+        "3. If no target folder exists, stop and ask the user to create/register the skill first.\n"
+        "4. Run: `skills verify <skill_name_or_path> --strict --verbose`\n"
+        "5. Use STRICT findings as the improvement checklist.\n\n"
         "GOAL\n"
-        "Improve the entire registered skill folder (all relevant files, not just SKILL.md) so it passes STRICT mode.\n"
-        "Minor refinement additions are allowed if they improve clarity, consistency, and agentskills.io alignment.\n\n"
+        "Improve the entire target skill folder (all relevant files, not just SKILL.md) so it passes STRICT mode.\n"
+        "Minor refinement additions are allowed if they improve clarity, consistency, and agentskills.io alignment.\n"
+        "If the target is an unregistered local folder in bad shape, repair it enough to pass verification, then the user can register it.\n\n"
         "COMMON FIXES FOR STRICT PASS\n"
         "- Add/repair frontmatter fields used by strict quality checks (`triggers`, `references`, `activation`)\n"
         "- Move examples/large code blocks out of `SKILL.md` into `references/`\n"
@@ -161,6 +163,7 @@ def default_improve_prompt() -> str:
         "CONSTRAINTS\n"
         "- Do not copy to agent directories directly (`skills install` handles distribution).\n"
         "- Preserve agentskills.io spec compliance while improving strict quality.\n"
+        "- If the folder is missing `SKILL.md` or has invalid YAML, create/fix it as part of the improvement.\n"
     )
 
 
@@ -269,6 +272,13 @@ def _enforce_gate(result, gate: str) -> None:
         raise typer.Exit(code=1)
     if gate == "strict" and not result.strict_passed:
         raise typer.Exit(code=1)
+
+
+def _gate_passed(result, gate: str) -> bool:
+    gate = gate.lower().strip()
+    if gate not in {"spec", "strict"}:
+        raise typer.BadParameter("`--gate` must be `spec` or `strict`.")
+    return result.spec_passed if gate == "spec" else result.strict_passed
 
 
 def _status_text(passed: bool) -> str:
@@ -387,7 +397,15 @@ def _print_verification_report(result, verbose: bool = False, output: str = "pre
 
     if not verbose:
         if result.spec_errors or result.errors:
-            _render_issue_group("Errors", result.spec_errors + result.errors, [])
+            seen = set()
+            merged_errors = []
+            for issue in [*result.spec_errors, *result.errors]:
+                key = issue.message
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_errors.append(issue)
+            _render_issue_group("Errors", merged_errors, [])
         typer.secho(
             "\nTip: Use --verbose for full spec/strict warnings and grouped findings.",
             fg=typer.colors.BRIGHT_BLACK,
@@ -521,10 +539,19 @@ def register(
     src_path = expand_home(source)
     if src_path is None:
         raise typer.BadParameter("Missing source path")
-    validate_skill_dir(src_path)
     verification = verify_skill_directory(src_path)
     _print_verification_report(verification, verbose=verbose, output=output)
-    _enforce_gate(verification, gate)
+    if not _gate_passed(verification, gate):
+        typer.secho(
+            f"\nRegistration blocked by `{gate}` gate.",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        typer.secho(
+            f"Repair path: run `skills improve {src_path}` and fix the folder in-place, then register again.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
 
     skill_name = (name or src_path.name).strip()
     if not skill_name:
@@ -682,24 +709,35 @@ def prompt() -> None:
 
 @app.command()
 def improve(
-    skill_name: Annotated[str, typer.Argument(help="Registered skill name to improve")],
+    target: Annotated[
+        str, typer.Argument(help="Registered skill name OR local folder path to improve")
+    ],
     verify_first: Annotated[
         bool, typer.Option("--verify/--no-verify", help="Run STRICT verification before showing improve instructions")
     ] = True,
     verbose: Annotated[bool, typer.Option("--verbose", help="Show full STRICT findings when verifying")] = True,
     output: Annotated[str, typer.Option("--output", help="Verify output format: pretty, text, json")] = "pretty",
 ) -> None:
-    """Prepare improvement of a registered skill folder and show the LLM invocation."""
+    """Prepare improvement of a skill folder (registered or local path) and show the LLM invocation."""
     ensure_dir(REGISTRY_SKILLS_DIR)
-    skill_dir = (REGISTRY_SKILLS_DIR / skill_name).resolve()
-    if not skill_dir.exists() or not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
+    skill_dir = resolve_skill_source(target)
+    if not skill_dir.exists() or not skill_dir.is_dir():
         raise typer.BadParameter(
-            f"Registered skill not found: {skill_name}. Create/register it first in {REGISTRY_SKILLS_DIR}."
+            f"Target skill folder not found: {target}. Pass a registered skill name or an existing folder path."
         )
 
-    typer.secho(f"Improve Skill Folder: {skill_name}", fg=typer.colors.CYAN, bold=True)
+    target_label = target
+    try:
+        rel = skill_dir.relative_to(REGISTRY_SKILLS_DIR)
+        target_kind = "registered"
+        target_label = rel.as_posix()
+    except ValueError:
+        target_kind = "local-path"
+
+    typer.secho(f"Improve Skill Folder: {target_label}", fg=typer.colors.CYAN, bold=True)
+    typer.echo(f"Target kind: {target_kind}")
     typer.echo(f"Target folder: {skill_dir}")
-    typer.echo(f"LLM entrypoint: {IMPROVE_PROMPT_PATH} {skill_name}")
+    typer.echo(f"LLM entrypoint: {IMPROVE_PROMPT_PATH} {target}")
 
     if verify_first:
         typer.secho("\nPreflight STRICT verify", fg=typer.colors.BRIGHT_BLUE, bold=True)
@@ -716,7 +754,14 @@ def improve(
                 fg=typer.colors.YELLOW,
             )
 
-    typer.echo(f"\nRun in Gemini/Claude CLI: {IMPROVE_PROMPT_PATH} {skill_name}")
+        if target_kind == "local-path" and result.spec_passed:
+            typer.secho(
+                "\nAfter repair, you can register it with: "
+                f"skills register {skill_dir}",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+
+    typer.echo(f"\nRun in Gemini/Claude CLI: {IMPROVE_PROMPT_PATH} {target}")
 
 
 @app.command("improve-path")
