@@ -34,7 +34,7 @@ REGISTRY_ROOT = HOME / "skills"
 REGISTRY_SKILLS_DIR = REGISTRY_ROOT / "skills"
 BUILDER_PROMPT_PATH = REGISTRY_ROOT / "skill.build"
 IMPROVE_PROMPT_PATH = REGISTRY_ROOT / "skill.improve"
-AGENTS = ("codex", "claude", "kiro", "gemini")
+AGENTS = ("codex", "claude", "kiro", "gemini", "antigravity")
 
 
 def expand_home(value: str | None) -> Path | None:
@@ -52,6 +52,24 @@ def normalize_skill_name(name: str) -> str:
     while "--" in normalized:
         normalized = normalized.replace("--", "-")
     return normalized.strip("-")
+
+
+SKILL_MD_NAMES = {"SKILL.md", "SKILLS.md", "skills.md"}
+
+
+def has_skill_file(path: Path) -> bool:
+    """Return True if the directory contains any recognized skill manifest file."""
+    return any((path / name).exists() for name in SKILL_MD_NAMES)
+
+
+def find_skill_folders_in_dir(path: Path) -> list[Path]:
+    """Return sorted direct child directories of `path` that contain a skill manifest file."""
+    if not path.is_dir():
+        return []
+    return sorted(
+        child for child in path.iterdir()
+        if child.is_dir() and has_skill_file(child)
+    )
 
 
 def validate_skill_dir(skill_dir: Path) -> None:
@@ -179,6 +197,7 @@ def agent_targets(project_root: Path) -> dict[str, Path]:
         "claude": project_root / ".claude" / "skills",
         "kiro": project_root / ".kiro" / "skills",
         "gemini": project_root / ".gemini" / "skills",
+        "antigravity": project_root / ".agent" / "skills",
     }
 
 
@@ -521,54 +540,128 @@ def create(
 
 @app.command()
 def register(
-    source: Annotated[Optional[str], typer.Argument(help="Path to generated skill folder")] = None,
-    name: Annotated[Optional[str], typer.Option("--name", help="Override registry skill folder name")] = None,
+    sources: Annotated[
+        list[str],
+        typer.Argument(
+            help=(
+                "Path(s) to skill folder(s). "
+                "Pass '.' to discover all skill subfolders in the current directory. "
+                "Multiple paths are accepted: skills register path1 path2 path3"
+            )
+        ),
+    ] = [],
+    name: Annotated[
+        Optional[str],
+        typer.Option("--name", help="Override registry folder name (single skill only)"),
+    ] = None,
     install: Annotated[bool, typer.Option("--install", help="Install to agent directories after register")] = False,
-    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
-    = [],
-    project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")]
-    = None,
+    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,antigravity,all")] = [],
+    project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")] = None,
     gate: Annotated[str, typer.Option("--gate", help="Registration gate: spec or strict")] = "spec",
     verbose: Annotated[bool, typer.Option("--verbose", help="Show full verification findings")] = False,
     output: Annotated[str, typer.Option("--output", help="Verification output format: pretty, text, json")] = "pretty",
 ) -> None:
-    """Register a skill into ~/skills/skills."""
-    if not source:
-        source = typer.prompt("Skill source folder path")
+    """Register one or more skills into ~/skills/skills.
 
-    src_path = expand_home(source)
-    if src_path is None:
-        raise typer.BadParameter("Missing source path")
-    verification = verify_skill_directory(src_path)
-    _print_verification_report(verification, verbose=verbose, output=output)
-    if not _gate_passed(verification, gate):
-        typer.secho(
-            f"\nRegistration blocked by `{gate}` gate.",
-            fg=typer.colors.RED,
-            bold=True,
-        )
-        typer.secho(
-            f"Repair path: run `skills improve {src_path}` and fix the folder in-place, then register again.",
-            fg=typer.colors.YELLOW,
-        )
-        raise typer.Exit(code=1)
+    Pass '.' to discover and register all skill subfolders in the current directory.
+    Multiple explicit paths are also accepted.
+    """
+    raw_sources = list(sources)
+    if not raw_sources:
+        raw_sources = [typer.prompt("Skill source folder path")]
 
-    skill_name = (name or src_path.name).strip()
-    if not skill_name:
-        raise typer.BadParameter("Resolved skill name is empty")
-    frontmatter_name = verification.get_frontmatter_name()
-    if frontmatter_name and name and skill_name != frontmatter_name:
-        raise typer.BadParameter(
-            f"--name ({skill_name}) must match SKILL.md frontmatter name ({frontmatter_name}) to remain spec-compliant."
-        )
+    if name and len(raw_sources) > 1:
+        raise typer.BadParameter("--name cannot be used when registering multiple skills.")
 
-    ensure_dir(REGISTRY_SKILLS_DIR)
-    dest = REGISTRY_SKILLS_DIR / skill_name
-    copy_dir(src_path, dest)
-    typer.echo(f"[register] {src_path} -> {dest}")
+    # Expand each source: directories without a skill file trigger discovery of subfolders
+    resolved: list[Path] = []
+    for src in raw_sources:
+        p = expand_home(src)
+        if p is None:
+            raise typer.BadParameter(f"Invalid path: {src}")
+        if p.is_dir() and not has_skill_file(p):
+            discovered = find_skill_folders_in_dir(p)
+            if not discovered:
+                typer.secho(f"[register] No skill folders found in: {p}", fg=typer.colors.YELLOW)
+            else:
+                typer.echo(f"[register] Discovered {len(discovered)} skill folder(s) in: {p}")
+                resolved.extend(discovered)
+        else:
+            resolved.append(p)
 
-    if install:
-        install_skills([skill_name], parse_agents(agent), project_root_from_option(project))
+    if not resolved:
+        raise typer.BadParameter("No skill source paths resolved.")
+
+    batch = len(resolved) > 1
+    project_root = project_root_from_option(project)
+    agents = parse_agents(agent)
+    success_count = 0
+    fail_count = 0
+
+    for src_path in resolved:
+        if batch:
+            typer.secho(f"\n--- {src_path.name} ---", fg=typer.colors.CYAN)
+
+        verification = verify_skill_directory(src_path)
+        _print_verification_report(verification, verbose=verbose, output=output)
+
+        if not _gate_passed(verification, gate):
+            if batch:
+                typer.secho(
+                    f"[register] Skipped {src_path.name} (failed `{gate}` gate).",
+                    fg=typer.colors.YELLOW,
+                )
+                fail_count += 1
+                continue
+            typer.secho(
+                f"\nRegistration blocked by `{gate}` gate.",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            typer.secho(
+                f"Repair path: run `skills improve {src_path}` and fix the folder in-place, then register again.",
+                fg=typer.colors.YELLOW,
+            )
+            raise typer.Exit(code=1)
+
+        skill_name = (name or src_path.name).strip()
+        if not skill_name:
+            if batch:
+                typer.secho(
+                    f"[register] Skipped: resolved skill name is empty for {src_path}",
+                    fg=typer.colors.YELLOW,
+                )
+                fail_count += 1
+                continue
+            raise typer.BadParameter("Resolved skill name is empty")
+
+        frontmatter_name = verification.get_frontmatter_name()
+        if frontmatter_name and name and skill_name != frontmatter_name:
+            if batch:
+                typer.secho(
+                    f"[register] Skipped {src_path.name}: --name ({skill_name}) does not match "
+                    f"SKILL.md name ({frontmatter_name}).",
+                    fg=typer.colors.YELLOW,
+                )
+                fail_count += 1
+                continue
+            raise typer.BadParameter(
+                f"--name ({skill_name}) must match SKILL.md frontmatter name ({frontmatter_name}) to remain spec-compliant."
+            )
+
+        ensure_dir(REGISTRY_SKILLS_DIR)
+        dest = REGISTRY_SKILLS_DIR / skill_name
+        copy_dir(src_path, dest)
+        typer.echo(f"[register] {src_path} -> {dest}")
+        success_count += 1
+
+        if install:
+            install_skills([skill_name], agents, project_root)
+
+    if batch:
+        typer.echo(f"\n[register] Done: {success_count} registered, {fail_count} skipped.")
+        if fail_count > 0:
+            raise typer.Exit(code=1)
 
 
 @app.command()
@@ -622,7 +715,7 @@ def deregister(
 def install(
     skill_name: Annotated[Optional[str], typer.Argument(help="Registered skill name")]
     = None,
-    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
+    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,antigravity,all")]
     = [],
     project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")]
     = None,
@@ -646,7 +739,7 @@ def sync(
         list[str],
         typer.Argument(help="Optional registered skill names to sync (defaults to all if omitted)"),
     ] = [],
-    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
+    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,antigravity,all")]
     = [],
     project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")]
     = None,
@@ -662,7 +755,7 @@ def sync(
 @app.command()
 def desync(
     skill_name: Annotated[Optional[str], typer.Argument(help="Installed/registered skill name")] = None,
-    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,all")]
+    agent: Annotated[list[str], typer.Option("--agent", help="Agent(s): codex,claude,kiro,gemini,antigravity,all")]
     = [],
     project: Annotated[Optional[str], typer.Option("--project", help="Project root for agent-local folders")] = None,
     all: Annotated[bool, typer.Option("--all", help="Remove all registered skills from agent directories")] = False,
